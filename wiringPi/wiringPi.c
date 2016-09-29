@@ -50,6 +50,9 @@
 //	02 May 2012:
 //		Added in the 2 UART pins
 //		Change maxPins to numPins to more accurately reflect purpose
+//
+//      28 Sep 2016 - Evan Platt:
+//              Added check for QEMU and configuration file
 
 
 #include <stdio.h>
@@ -70,6 +73,8 @@
 #include <sys/wait.h>
 #include <sys/ioctl.h>
 #include <asm/ioctl.h>
+#include <dirent.h>
+#include <pwd.h>
 
 #include "softPwm.h"
 #include "softTone.h"
@@ -289,7 +294,7 @@ static pthread_mutex_t pinMutex ;
 
 // Debugging & Return codes
 
-int wiringPiDebug       = FALSE ;
+int wiringPiDebug       = TRUE ;
 int wiringPiReturnCodes = FALSE ;
 
 // Use /dev/gpiomem ?
@@ -678,15 +683,109 @@ static void piBoardRevOops (const char *why)
   exit (EXIT_FAILURE) ;
 }
 
+static void piEmuCfgInfo(){
+
+  fprintf (stderr, "Under QEMU, a configuration file is required in your home folder with filename .emupi\n");
+  fprintf (stderr, "The file must have the following options defined:\n");
+  fprintf (stderr, "  -> board_rev = [board revision]\n");
+  fprintf (stderr, "  -> board_id  = [board id]\n\n");
+  fprintf (stderr, "board revision [1 or 2]:\n");
+  fprintf (stderr, "  Original Pi ver 1:  board revision = 1\n");
+  fprintf (stderr, "  Original Pi ver 2 or newer Pi: board revision = 2\n\n");
+  fprintf (stderr, "board id [0004-0015]:\n\n");
+  fprintf (stderr, "  0000 - Error\n");
+  fprintf (stderr, "  0001 - Not used\n\n");
+  fprintf (stderr, "  Original Pi boards:\n");
+  fprintf (stderr, "    0002 - Model B,  Rev 1,   256MB, Egoman\n");
+  fprintf (stderr, "    0003 - Model B,  Rev 1.1, 256MB, Egoman, Fuses/D14 removed.\n\n");
+  fprintf (stderr, "  Newer Pi's with remapped GPIO:\n");
+  fprintf (stderr, "    0004 - Model B,  Rev 2,   256MB, Sony\n");
+  fprintf (stderr, "    0005 - Model B,  Rev 2,   256MB, Qisda\n");
+  fprintf (stderr, "    0006 - Model B,  Rev 2,   256MB, Egoman\n");
+  fprintf (stderr, "    0007 - Model A,  Rev 2,   256MB, Egoman\n");
+  fprintf (stderr, "    0008 - Model A,  Rev 2,   256MB, Sony\n");
+  fprintf (stderr, "    0009 - Model A,  Rev 2,   256MB, Qisda\n");
+  fprintf (stderr, "    000d - Model B,  Rev 2,   512MB, Egoman (Red Pi, Blue Pi?)\n");
+  fprintf (stderr, "    000e - Model B,  Rev 2,   512MB, Sony\n");
+  fprintf (stderr, "    000f - Model B,  Rev 2,   512MB, Qisda\n");
+  fprintf (stderr, "    0010 - Model B+, Rev 1.2, 512MB, Sony\n");
+  fprintf (stderr, "    0011 - Pi CM,    Rev 1.2, 512MB, Sony\n");
+  fprintf (stderr, "    0012 - Model A+  Rev 1.2, 256MB, Sony\n");
+  fprintf (stderr, "    0014 - Pi CM,    Rev 1.1, 512MB, Sony (Actual Revision might be different)\n");
+  fprintf (stderr, "    0015 - Model A+  Rev 1.1, 256MB, Sony\n");
+  exit (EXIT_FAILURE) ;
+}
+
+
 int piBoardRev (void)
 {
-  FILE *cpuFd ;
-  char line [120] ;
-  char *c ;
+  DIR    *d ;
+  FILE   *cpuFd, *emucfg ;
+  struct dirent *dir ;
+  char   line [120] ;
+  char   *c ;
   static int  boardRev = -1 ;
+  char *homedir, *emucfg_path;
 
   if (boardRev != -1)	// No point checking twice
     return boardRev ;
+
+  // Check for QEMU platform
+
+  d = opendir("/dev/disk/by-id");
+  if (d){
+
+    while ((dir = readdir(d)) != NULL){
+
+      if (strstr (dir->d_name, "QEMU") != NULL){
+
+        // Found a QEMU drive
+
+        if (wiringPiDebug)
+          printf ("piboardRev: Found a QEMU filesystem.  Assuming this is a QEMU-emulated Pi.\n") ;
+
+        if ((homedir = getenv("HOME")) == NULL) {
+          homedir = getpwuid(getuid())->pw_dir;
+        }
+
+        emucfg_path = malloc(120);
+        strcpy(emucfg_path,homedir);
+        strcat(emucfg_path, "/.emupi");
+
+        if ((emucfg = fopen (emucfg_path, "r")) == NULL)
+          piEmuCfgInfo();
+
+        while (fgets (line, 120, emucfg) != NULL){
+
+          if (strstr (line, "board_rev") != NULL) {
+
+            if (wiringPiDebug)
+              printf ("piboardRev: Found board_rev line in .wiringEmuPi: %s\n",line) ;
+
+            // Scan past the '=''
+            for (c = line ; *c ; ++c)
+              if (*c == '=')
+                break ;
+            if (*c != '=')
+              piBoardRevOops ("Bogus \"board_rev\" line in .wiringEmuPi (no '=')") ;
+            // Skip spaces
+            ++c ;
+            while (isspace (*c))
+              ++c ;
+            // Check board_rev
+            if (*c != 0x31 && *c != 0x32)
+              piBoardRevOops ("Invalid board_rev in .wiringEmuPi (must be 1 or 2)");
+
+            return boardRev = (*c-0x30);
+
+          }
+
+        }
+
+      }
+    }
+    closedir(d);
+  }
 
   if ((cpuFd = fopen ("/proc/cpuinfo", "r")) == NULL)
     piBoardRevOops ("Unable to open /proc/cpuinfo") ;
@@ -743,7 +842,7 @@ int piBoardRev (void)
 
   for (c = &line [strlen (line) - 1] ; (*c == '\n') || (*c == '\r') ; --c)
     *c = 0 ;
-  
+
   if (wiringPiDebug)
     printf ("piboardRev: Revision string: %s\n", line) ;
 
@@ -815,7 +914,7 @@ int piBoardRev (void)
  *	So the distinction between boards that I can see is:
  *
  *		0000 - Error
- *		0001 - Not used 
+ *		0001 - Not used
  *
  *	Original Pi boards:
  *		0002 - Model B,  Rev 1,   256MB, Egoman
@@ -861,62 +960,123 @@ int piBoardRev (void)
 
 void piBoardId (int *model, int *rev, int *mem, int *maker, int *warranty)
 {
-  FILE *cpuFd ;
+  DIR    *d ;
+  FILE *cpuFd, *emucfg ;
+  struct dirent *dir ;
   char line [120] ;
   char *c ;
   unsigned int revision ;
   int bRev, bType, bProc, bMfg, bMem, bWarranty ;
+  char isQEMU=0;
+  char *homedir, *emucfg_path;
 
 //	Will deal with the properly later on - for now, lets just get it going...
 //  unsigned int modelNum ;
 
   (void)piBoardRev () ;	// Call this first to make sure all's OK. Don't care about the result.
 
-  if ((cpuFd = fopen ("/proc/cpuinfo", "r")) == NULL)
-    piBoardRevOops ("Unable to open /proc/cpuinfo") ;
+  // Check for QEMU platform
 
-  while (fgets (line, 120, cpuFd) != NULL)
-    if (strncmp (line, "Revision", 8) == 0)
-      break ;
+  d = opendir("/dev/disk/by-id");
+  if (d){
 
-  fclose (cpuFd) ;
+    while ((dir = readdir(d)) != NULL){
 
-  if (strncmp (line, "Revision", 8) != 0)
-    piBoardRevOops ("No \"Revision\" line") ;
+      if (strstr (dir->d_name, "QEMU") != NULL){
 
-// Chomp trailing CR/NL
+        // Found a QEMU drive
 
-  for (c = &line [strlen (line) - 1] ; (*c == '\n') || (*c == '\r') ; --c)
-    *c = 0 ;
-  
-  if (wiringPiDebug)
-    printf ("piBoardId: Revision string: %s\n", line) ;
+        isQEMU=1;
+        if (wiringPiDebug)
+          printf ("piboardId: Found a QEMU filesystem.  Assuming this is a QEMU-emulated Pi.\n") ;
 
-// Need to work out if it's using the new or old encoding scheme:
+        if ((homedir = getenv("HOME")) == NULL) {
+          homedir = getpwuid(getuid())->pw_dir;
+        }
 
-// Scan to the first character of the revision number
+        emucfg_path = malloc(120);
+        strcpy(emucfg_path,homedir);
+        strcat(emucfg_path, "/.emupi");
 
-  for (c = line ; *c ; ++c)
-    if (*c == ':')
-      break ;
+        if ((emucfg = fopen (emucfg_path, "r")) == NULL)
+          piEmuCfgInfo();
 
-  if (*c != ':')
-    piBoardRevOops ("Bogus \"Revision\" line (no colon)") ;
+        while (fgets (line, 120, emucfg) != NULL){
 
-// Chomp spaces
+          if (strstr (line, "board_id") != NULL) {
 
-  ++c ;
-  while (isspace (*c))
+            if (wiringPiDebug)
+              printf ("piboardId: Found board_id line in .wiringEmuPi: %s\n",line) ;
+
+            // Scan past the '=''
+            for (c = line ; *c ; ++c)
+              if (*c == '=')
+                break ;
+            if (*c != '=')
+              piBoardRevOops ("Bogus \"board_id\" line in .wiringEmuPi (no '=')") ;
+            // Skip spaces
+            ++c ;
+            while (isspace (*c))
+              ++c ;
+
+          }
+
+        }
+
+      }
+    }
+    closedir(d);
+  }
+
+  if (isQEMU==0){
+
+    if ((cpuFd = fopen ("/proc/cpuinfo", "r")) == NULL)
+      piBoardRevOops ("Unable to open /proc/cpuinfo") ;
+
+    while (fgets (line, 120, cpuFd) != NULL)
+      if (strncmp (line, "Revision", 8) == 0)
+        break ;
+
+    fclose (cpuFd) ;
+
+    if (strncmp (line, "Revision", 8) != 0)
+      piBoardRevOops ("No \"Revision\" line") ;
+
+  // Chomp trailing CR/NL
+
+    for (c = &line [strlen (line) - 1] ; (*c == '\n') || (*c == '\r') ; --c)
+      *c = 0 ;
+
+    if (wiringPiDebug)
+      printf ("piBoardId: Revision string: %s\n", line) ;
+
+  // Need to work out if it's using the new or old encoding scheme:
+
+  // Scan to the first character of the revision number
+
+    for (c = line ; *c ; ++c)
+      if (*c == ':')
+        break ;
+
+    if (*c != ':')
+      piBoardRevOops ("Bogus \"Revision\" line (no colon)") ;
+
+  // Chomp spaces
+
     ++c ;
+    while (isspace (*c))
+      ++c ;
 
-  if (!isxdigit (*c))
-    piBoardRevOops ("Bogus \"Revision\" line (no hex digit at start of revision)") ;
+    if (!isxdigit (*c))
+      piBoardRevOops ("Bogus \"Revision\" line (no hex digit at start of revision)") ;
 
-  revision = (unsigned int)strtol (c, NULL, 16) ; // Hex number with no leading 0x
+    revision = (unsigned int)strtol (c, NULL, 16) ; // Hex number with no leading 0x
 
-// Check for new way:
+  } //end if (isQEMU==0)
 
-  if ((revision &  (1 << 23)) != 0)	// New way
+  // Check for new way:
+
+  if (isQEMU==0 && (revision &  (1 << 23)) != 0)	// New way
   {
     if (wiringPiDebug)
       printf ("piBoardId: New Way: revision is: 0x%08X\n", revision) ;
@@ -927,7 +1087,7 @@ void piBoardId (int *model, int *rev, int *mem, int *maker, int *warranty)
     bMfg      = (revision & (0x0F << 16)) >> 16 ;
     bMem      = (revision & (0x07 << 20)) >> 20 ;
     bWarranty = (revision & (0x03 << 24)) != 0 ;
-    
+
     *model    = bType ;
     *rev      = bRev ;
     *mem      = bMem ;
@@ -954,7 +1114,7 @@ void piBoardId (int *model, int *rev, int *mem, int *maker, int *warranty)
 // If longer than 4, we'll assume it's been overvolted
 
     *warranty = strlen (c) > 4 ;
-  
+
 // Extract last 4 characters:
 
     c = c + strlen (c) - 4 ;
@@ -981,7 +1141,7 @@ void piBoardId (int *model, int *rev, int *mem, int *maker, int *warranty)
     else                              { *model = 0           ; *rev = 0              ; *mem =   0 ; *maker = 0 ;               }
   }
 }
- 
+
 
 
 /*
@@ -1176,7 +1336,7 @@ void gpioClockSet (int pin, int freq)
     pin = physToGpio [pin] ;
   else if (wiringPiMode != WPI_MODE_GPIO)
     return ;
-  
+
   if (RASPBERRY_PI_PERI_BASE == 0)	// Ignore for now
     return ;
 
@@ -1423,7 +1583,7 @@ void pullUpDnControl (int pin, int pud)
 
     *(gpio + GPPUD)              = pud & 3 ;		delayMicroseconds (5) ;
     *(gpio + gpioToPUDCLK [pin]) = 1 << (pin & 31) ;	delayMicroseconds (5) ;
-    
+
     *(gpio + GPPUD)              = 0 ;			delayMicroseconds (5) ;
     *(gpio + gpioToPUDCLK [pin]) = 0 ;			delayMicroseconds (5) ;
   }
@@ -1556,7 +1716,7 @@ void pwmWrite (int pin, int value)
 
 /*
  * analogRead:
- *	Read the analog value of a given Pin. 
+ *	Read the analog value of a given Pin.
  *	There is no on-board Pi analog hardware,
  *	so this needs to go to a new node.
  *********************************************************************************
@@ -1575,7 +1735,7 @@ int analogRead (int pin)
 
 /*
  * analogWrite:
- *	Write the analog value to the given Pin. 
+ *	Write the analog value to the given Pin.
  *	There is no on-board Pi analog hardware,
  *	so this needs to go to a new node.
  *********************************************************************************
@@ -1625,7 +1785,7 @@ void pwmToneWrite (int pin, int freq)
  *	Write an 8-bit byte to the first 8 GPIO pins - try to do it as
  *	fast as possible.
  *	However it still needs 2 operations to set the bits, so any external
- *	hardware must not rely on seeing a change as there will be a change 
+ *	hardware must not rely on seeing a change as there will be a change
  *	to set the outputs bits to zero, then another change to set the 1's
  *	Reading is just bit fiddling.
  *	These are wiringPi pin numbers 0..7, or BCM_GPIO pin numbers
@@ -1681,7 +1841,7 @@ unsigned int digitalReadByte (void)
       data = (data << 1) | x ;
     }
   }
-  else 
+  else
   {
     raw = *(gpio + gpioToGPLEV [0]) ; // First bank for these pins
     for (pin = 0 ; pin < 8 ; ++pin)
@@ -1738,7 +1898,7 @@ unsigned int digitalReadByte2 (void)
       data = (data << 1) | x ;
     }
   }
-  else 
+  else
     data = ((*(gpio + gpioToGPLEV [0])) >> 20) & 0xFF ; // First bank for these pins
 
   return data ;
@@ -2143,13 +2303,13 @@ int wiringPiSetup (void)
   pwm = (uint32_t *)mmap(0, BLOCK_SIZE, PROT_READ|PROT_WRITE, MAP_SHARED, fd, GPIO_PWM) ;
   if ((int32_t)pwm == -1)
     return wiringPiFailure (WPI_ALMOST, "wiringPiSetup: mmap (PWM) failed: %s\n", strerror (errno)) ;
- 
+
 //	Clock control (needed for PWM)
 
   clk = (uint32_t *)mmap(0, BLOCK_SIZE, PROT_READ|PROT_WRITE, MAP_SHARED, fd, GPIO_CLOCK_BASE) ;
   if ((int32_t)clk == -1)
     return wiringPiFailure (WPI_ALMOST, "wiringPiSetup: mmap (CLOCK) failed: %s\n", strerror (errno)) ;
- 
+
 //	The drive pads
 
   pads = (uint32_t *)mmap(0, BLOCK_SIZE, PROT_READ|PROT_WRITE, MAP_SHARED, fd, GPIO_PADS) ;
@@ -2278,7 +2438,7 @@ int wiringPiSetupSys (void)
 
 // Open and scan the directory, looking for exported GPIOs, and pre-open
 //	the 'value' interface to speed things up for later
-  
+
   for (pin = 0 ; pin < 64 ; ++pin)
   {
     sprintf (fName, "/sys/class/gpio/gpio%d/value", pin) ;
